@@ -1,0 +1,316 @@
+import os
+import logging
+import re
+import threading
+import time
+import asyncio
+from datetime import datetime
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+
+# ==================== الإعدادات الأساسية ====================
+TOKEN = os.environ.get('BOT_TOKEN', '8260723411:AAGDobfEt5SeuAEltqsZ-pqXIHP9_AgLk9w')
+
+# إعدادات التسجيل
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# تخزين مؤقت للعمليات (لكل مستخدم)
+user_sessions = {}
+
+# ==================== كود Flask لتشغيل السيرفر ====================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "✅ بوت إنشاء Gmail شغال!"
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
+def run_flask():
+    """تشغيل خادم Flask في خلفية منفصلة"""
+    port = int(os.environ.get('PORT', 8000))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+# ==================== إعدادات Selenium ====================
+
+def create_driver():
+    """إنشاء متصفح Chrome مع الإعدادات المناسبة للسيرفر"""
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-notifications")
+    chrome_options.add_argument("--disable-popup-blocking")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        return driver
+    except Exception as e:
+        logger.error(f"خطأ في إنشاء المتصفح: {str(e)}")
+        return None
+
+def create_gmail_account(first_name, desired_email, password):
+    """
+    دالة إنشاء حساب Gmail باستخدام Selenium
+    ترجع: (نجاح/فشل, رسالة, الإيميل الكامل)
+    """
+    driver = None
+    try:
+        driver = create_driver()
+        if not driver:
+            return False, "❌ فشل إنشاء المتصفح. تأكد من تثبيت Chrome على السيرفر.", None
+        
+        logger.info("جاري فتح صفحة التسجيل...")
+        driver.get("https://accounts.google.com/signup")
+        time.sleep(3)
+        
+        logger.info("جاري إدخال الاسم...")
+        first_name_field = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.ID, "firstName"))
+        )
+        first_name_field.send_keys(first_name)
+        
+        last_name_field = driver.find_element(By.ID, "lastName")
+        last_name_field.send_keys(first_name)
+        
+        next_button = driver.find_element(By.XPATH, "//span[text()='Next']")
+        next_button.click()
+        time.sleep(3)
+        
+        logger.info("جاري إدخال تاريخ الميلاد...")
+        month_field = driver.find_element(By.ID, "month")
+        month_field.send_keys("January")
+        
+        day_field = driver.find_element(By.ID, "day")
+        day_field.send_keys("15")
+        
+        year_field = driver.find_element(By.ID, "year")
+        year_field.send_keys("1990")
+        
+        gender_field = driver.find_element(By.ID, "gender")
+        gender_field.send_keys("Male")
+        
+        next_button = driver.find_element(By.XPATH, "//span[text()='Next']")
+        next_button.click()
+        time.sleep(3)
+        
+        logger.info("جاري اختيار اسم المستخدم...")
+        try:
+            create_own = driver.find_element(By.XPATH, "//span[contains(text(),'Create your own')]")
+            create_own.click()
+            time.sleep(2)
+        except:
+            pass
+        
+        username_field = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.NAME, "Username"))
+        )
+        username_field.clear()
+        username_field.send_keys(desired_email)
+        
+        next_button = driver.find_element(By.XPATH, "//span[text()='Next']")
+        next_button.click()
+        time.sleep(3)
+        
+        page_source = driver.page_source
+        if "That username is taken" in page_source or "not available" in page_source:
+            return False, "❌ اسم المستخدم هذا محجوز، جرب اسماً آخر", None
+        
+        logger.info("جاري إدخال كلمة السر...")
+        password_field = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.NAME, "Passwd"))
+        )
+        password_field.send_keys(password)
+        
+        confirm_field = driver.find_element(By.NAME, "PasswdAgain")
+        confirm_field.send_keys(password)
+        
+        next_button = driver.find_element(By.XPATH, "//span[text()='Next']")
+        next_button.click()
+        time.sleep(5)
+        
+        page_source = driver.page_source
+        if "phoneNumber" in page_source or "Phone number" in page_source:
+            return False, "⚠️ Google تطلب رقم هاتف للتحقق. البوت لا يدعم التحقق الهاتفي بعد.", None
+        
+        email = f"{desired_email}@gmail.com"
+        return True, f"✅ تم إنشاء الحساب بنجاح!\n📧 الإيميل: {email}\n🔑 كلمة السر: {password}", email
+        
+    except Exception as e:
+        logger.error(f"خطأ في إنشاء الحساب: {str(e)}")
+        return False, f"❌ حدث خطأ: {str(e)}", None
+    
+    finally:
+        if driver:
+            driver.quit()
+
+# ==================== معالجي البوت ====================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """رسالة الترحيب"""
+    user = update.effective_user
+    username = f"@{user.username}" if user.username else user.first_name
+    
+    welcome_text = f"""
+🎉 **مرحباً بك {username} في بوت إنشاء Gmail!**
+
+📧 **هذا البوت يساعدك في إنشاء حساب Gmail جديد.**
+
+📝 **طريقة الاستخدام:**
+أرسل لي البيانات بهذا الشكل:
+
+`الاسم الأول | اسم الإيميل | كلمة السر`
+
+✅ **مثال:**
+`أحمد | ahmed123 | MyPassword123`
+
+⚠️ **ملاحظات مهمة:**
+• Google تطلب رقم هاتف للتحقق في بعض الحالات
+• قد لا ينجح الإنشاء إذا كان الإيميل محجوز
+• استخدم كلمة سر قوية (حروف وأرقام)
+
+⚙️ اختر من الأزرار تحت:
+"""
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("📧 إنشاء حساب", callback_data="create"),
+            InlineKeyboardButton("ℹ️ مساعدة", callback_data="help")
+        ],
+        [
+            InlineKeyboardButton("👤 مطور البوت", url="https://t.me/SI123FO")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة الرسائل النصية (البيانات)"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    pattern = r'^(.+?)\s*\|\s*(.+?)\s*\|\s*(.+)$'
+    match = re.match(pattern, text)
+    
+    if not match:
+        await update.message.reply_text(
+            "❌ **صيغة خاطئة!**\n\n"
+            "أرسل البيانات بهذا الشكل:\n"
+            "`الاسم الأول | اسم الإيميل | كلمة السر`\n\n"
+            "مثال: `أحمد | ahmed123 | MyPassword123`"
+        )
+        return
+    
+    first_name = match.group(1).strip()
+    desired_email = match.group(2).strip()
+    password = match.group(3).strip()
+    
+    if len(password) < 8:
+        await update.message.reply_text("❌ كلمة السر قصيرة جداً! استخدم 8 أحرف على الأقل.")
+        return
+    
+    status_msg = await update.message.reply_text(
+        f"🔄 جاري إنشاء الحساب...\n"
+        f"الاسم: {first_name}\n"
+        f"الإيميل المطلوب: {desired_email}@gmail.com\n"
+        f"يرجى الانتظار (قد يستغرق 2-3 دقائق)"
+    )
+    
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None, 
+        create_gmail_account, 
+        first_name, desired_email, password
+    )
+    
+    success, message, email = result
+    
+    if success:
+        await status_msg.edit_text(message)
+    else:
+        await status_msg.edit_text(message)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج الأزرار"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data == "create":
+        await query.edit_message_text(
+            "📧 **إنشاء حساب Gmail جديد**\n\n"
+            "أرسل لي البيانات بهذا الشكل:\n\n"
+            "`الاسم الأول | اسم الإيميل | كلمة السر`\n\n"
+            "مثال: `محمد | mohamed123 | MyPass@2025`"
+        )
+    
+    elif data == "help":
+        help_text = """
+ℹ️ **مساعدة البوت**
+
+📌 **كيفية الاستخدام:**
+1. أرسل البيانات بالصيغة: `الاسم | الإيميل | كلمة السر`
+2. البوت يبدأ في إنشاء الحساب (يستغرق 2-3 دقائق)
+3. استلم نتيجة الإنشاء
+
+⚠️ **ملاحظات مهمة:**
+• Google تطلب رقم هاتف في بعض الأحيان
+• إذا طلب رقم هاتف، العملية تفشل
+• تأكد أن الإيميل غير محجوز
+• استخدم كلمة سر قوية
+
+👤 مطور البوت: @SI123FO
+"""
+        await query.edit_message_text(help_text, parse_mode='Markdown')
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج الأخطاء"""
+    logger.error(f"حدث خطأ: {context.error}")
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text("❌ حدث خطأ داخلي. الرجاء المحاولة لاحقاً.")
+    except:
+        pass
+
+# ==================== الدالة الرئيسية ====================
+
+def main():
+    """تشغيل البوت مع Flask في الخلفية"""
+    
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("✅ خادم Flask شغال في الخلفية")
+    
+    application = Application.builder().token(TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_error_handler(error_handler)
+    
+    print("✅ بوت إنشاء Gmail يعمل...")
+    print("👤 يوزر المطور: @SI123FO")
+    
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
